@@ -1,0 +1,50 @@
+services:
+  mock-kube:
+    build: .
+    image: volume-handover:local
+    command:
+      - uvicorn
+      - mock_kube.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+    environment:
+      MOCK_SEED: "1"
+      LOG_LEVEL: info
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8001/_mock/state')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  handover:
+    build: .
+    image: volume-handover:local
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      # "remote" -> go through the official kubernetes client to mock-kube.
+      # Change the kubeconfig server (or drop the volume mount) for a real cluster.
+      KUBE_MODE: remote
+      KUBECONFIG: /etc/kube/config
+      KUBE_REQUEST_TIMEOUT: "10"
+    volumes:
+      - ./deploy/kubeconfig:/etc/kube/config:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      mock-kube:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
