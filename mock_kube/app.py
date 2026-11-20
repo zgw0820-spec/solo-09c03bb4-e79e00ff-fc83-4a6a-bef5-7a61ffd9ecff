@@ -7,7 +7,7 @@ path end to end.
 
 It is deliberately *not* a general-purpose Kubernetes emulator: only PV/PVC
 read, PV merge-patch and a small operator surface (create/delete fixtures,
-trigger the binder) are implemented. Anything else returns 404.
+run an incremental reconcile round) are implemented. Anything else returns 404.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from app.kube import Conflict, Invalid, NotFound
@@ -55,7 +56,8 @@ def create_app(store: InMemoryKube | None = None) -> FastAPI:
             "* `POST /_mock/namespaces/{namespace}/pvcs` 创建 PVC\n"
             "* `DELETE /_mock/namespaces/{namespace}/pvcs/{name}` 删除 PVC（模拟旧声明被删）\n"
             "* `POST /_mock/bind/{pv}` 触发一次绑定\n"
-            "* `POST /_mock/reconcile` 对所有可绑定卷执行绑定\n"
+            "* `POST /_mock/reconcile` 增量绑定一轮（只处理自上一轮以来变更过的卷）\n"
+            "* `GET /_mock/reconcile/state` 查看本轮待处理的卷\n"
             "* `GET /_mock/state` 查看全部 PV/PVC\n"
             "* `POST /_mock/reset` 清空状态\n"
         ),
@@ -95,7 +97,7 @@ def _install(app: FastAPI, store: InMemoryKube) -> None:
         except ValueError:
             return _status_error(400, "BadRequest", "request body is not valid JSON")
         try:
-            return store.update_pv(name, body)
+            return await run_in_threadpool(store.update_pv, name, body)
         except NotFound as exc:
             return _status_error(404, "NotFound", str(exc))
         except Conflict as exc:
@@ -163,7 +165,14 @@ def _install(app: FastAPI, store: InMemoryKube) -> None:
 
     @app.post("/_mock/reconcile")
     async def reconcile() -> dict[str, Any]:
-        return {"bound": store.reconcile()}
+        # The round serialises on the store's round lock, but the underlying
+        # object lock is only held per volume, so reads and handover submits
+        # keep being served while it runs.
+        return await run_in_threadpool(store.reconcile)
+
+    @app.get("/_mock/reconcile/state")
+    async def reconcile_state() -> dict[str, Any]:
+        return store.reconcile_state()
 
     @app.get("/_mock/state")
     async def state() -> dict[str, Any]:

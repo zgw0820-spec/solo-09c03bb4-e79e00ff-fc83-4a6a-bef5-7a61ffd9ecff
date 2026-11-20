@@ -22,8 +22,8 @@
 │   ├── app.py           # core/v1 的 PV/PVC 子集 + 运维夹具接口
 │   ├── store.py         # 内存对象存储、乐观并发、绑定器
 │   └── seed.py          # 演示用预置场景
-├── tests/               # pytest
-├── scripts/             # demo、并发探针
+├── tests/               # pytest（规则、并发、HTTP、增量轮次）
+├── scripts/             # demo、增量轮次演示、并发探针
 ├── deploy/kubeconfig    # Compose 中服务指向 mock-kube 的 kubeconfig
 ├── Dockerfile
 └── docker-compose.yml
@@ -60,7 +60,8 @@ docker compose up --build
 
 1. 提交 → `202`，`status: pending_binding`（预留已写入 `spec.claimRef`，尚未 Bound）。
 2. 再次提交同一请求 → 仍为 `202`，内容不变；**不会重复写 PV**（幂等重试即查进度）。
-3. 让绑定完成 —— 模拟端提供 `POST /_mock/bind/pvc-5f0c1c9e-aaaa-4bbb-8ccc-0123456789ab`
+3. 让绑定完成 —— 模拟端提供 `POST /_mock/reconcile`（增量绑定一轮，见下节）；
+   单卷也可用 `POST /_mock/bind/pvc-5f0c1c9e-aaaa-4bbb-8ccc-0123456789ab`
    （真实集群里由 PV controller 自动完成）。
 4. 再次提交 → `200`，`status: completed`，PV 与 PVC 均已 Bound 且相互指向。
 5. 也可以随时只读查询：`GET /handovers/status?pv_name=…&old_pvc_uid=…&namespace=…&name=…&uid=…`
@@ -79,6 +80,45 @@ docker compose up --build
 预置数据可用 `POST http://localhost:8001/_mock/reset` 之外的接口自行扩展：
 `POST /_mock/pvs`、`POST /_mock/namespaces/{ns}/pvcs`、
 `DELETE /_mock/namespaces/{ns}/pvcs/{name}`、`POST /_mock/reconcile`、`GET /_mock/state`。
+
+## 增量绑定（`POST /_mock/reconcile`）
+
+模拟端的绑定器按**增量轮次**运行，不再每轮扫描全部 PV：
+
+* **登记**：创建、更新、删除 PV，以及创建、删除 PVC 时，只把受该变更影响且
+  仍然存在的卷登记到下一轮。PVC 变更通过 `spec.claimRef` 的命名空间/名称索引
+  和 PVC 自身的 `spec.volumeName` 直接定位关联卷，不需要遍历 PV。
+* **取快照**：每轮开始时只取当时已登记、且仍存在的卷；轮次运行期间发生的
+  变更（包括新建、同名重建）留到下一轮。
+* **尝试前复核**：对每卷尝试绑定前，比较该卷及其声明的变更计数；若快照之后
+  又变化过（同名 PVC/PV 重建也算），本轮不尝试，留到下一轮按最新对象处理。
+* **条件不满足不空转**：claimRef/UID 不匹配、PVC 不存在、容量/存储类/访问
+  模式/卷模式不满足等都会让本轮放弃该卷；只有相关对象再次变动才会重新登记
+  并重试。
+* **并发**：轮次只对单个卷短暂持有对象锁，绑定在锁内完成；整轮运行期间
+  读取 PV/PVC、`/healthz`、`POST /handovers` 都照常服务。
+
+`POST /_mock/reconcile` 返回本轮明细：
+
+```json
+{
+  "round": 3,
+  "registered": 2,
+  "attempted": ["pvc-batch-aaaa-…-0001", "pvc-batch-bbbb-…-0002"],
+  "bound": [],
+  "deferred": [],
+  "skipped": [],
+  "pending": 0
+}
+```
+
+`GET /_mock/reconcile/state` 只读查看下一轮将处理的卷。演示步骤：
+
+```bash
+docker compose up --build
+python3 scripts/reconcile_demo.py     # 自己造 6 个卷：跑一轮、无改动再跑、改 2 个卷、新建 3 个卷、同名重建、并发可用性
+python3 scripts/demo.py               # 进程内按 README 的 13 步走一遍
+```
 
 ## 交接规则
 
@@ -172,9 +212,10 @@ KUBE_MODE=remote KUBECONFIG=$PWD/deploy/kubeconfig uvicorn app.main:app --port 8
 ## 测试与验证
 
 ```bash
-python3 -m pytest                      # 46 个用例：规则、并发冲突、HTTP 合约、真实客户端到模拟端的端到端
-python3 scripts/demo.py                # 按 README 的 7 步走一遍，逐条打印
+python3 -m pytest                      # 62 个用例：规则、并发冲突、HTTP 合约、增量绑定、真实客户端到模拟端的端到端
+python3 scripts/demo.py                # 按 README 的 13 步走一遍（含增量轮次），逐条打印
 python3 scripts/concurrency_probe.py   # 20 轮 10 方并发交接 + 12 路重试风暴
+python3 scripts/reconcile_demo.py      # 对运行中的 Compose 栈演示增量轮次与并发可用性
 ```
 
 `tests/test_api.py` 的 `live_servers` 固件真的用 uvicorn 起模拟端，再由官方
@@ -186,6 +227,12 @@ python3 scripts/concurrency_probe.py   # 20 轮 10 方并发交接 + 12 路重�
 * 模拟端只实现本服务用到的 `core/v1` 子集（PV/PVC 读、PV merge patch、夹具接口），
   不是通用 Kubernetes 模拟器；它不会运行 scheduler、kubelet、storage provisioner，
   绑定需要 `POST /_mock/bind/...` 或 `POST /_mock/reconcile` 触发。
+* 模拟端的增量登记只存在于内存中，进程重启后需要由下一次变更重新登记；这与
+  真实集群里 informer 全量 list 后转为增量的行为等价，但这里没有实现启动时的
+  历史回放，因此重启前已变更但未绑定的卷不会自动补跑。
+* 轮次按单进程串行执行（`_round_lock`），对象锁只覆盖单卷检查与绑定；模拟端
+  没有实现真实 API server 的 watch 与 resourceVersion 语义，同名重建靠内部
+  变更计数识别。
 * 只处理 `PersistentVolume` 已处于 `Released` 的场景。旧 PVC 仍存在（`Bound`）时
   必须先删除旧工作负载和旧 PVC，本服务不会代劳删除。
 * 没有对 `ReadWriteOncePod` 等特殊访问模式做额外校验，按子集规则统一处理。

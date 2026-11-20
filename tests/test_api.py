@@ -270,3 +270,76 @@ def test_binder_refuses_incompatible_pair(wire_client, live_servers):
     })
     with pytest.raises(Exception):
         store.bind_pv(PV_NAME)
+
+
+def test_reconcile_http_round_is_incremental(wire_client, live_servers):
+    """Over HTTP, a round reports what it registered/attempted/bound, and a
+    second round with no changes attempts nothing."""
+    store, base_url = live_servers
+
+    def post(path: str) -> dict:
+        request = urllib.request.Request(f"{base_url}{path}", method="POST")
+        return json.loads(urllib.request.urlopen(request).read())
+
+    def get(path: str) -> dict:
+        return json.loads(urllib.request.urlopen(f"{base_url}{path}").read())
+
+    app = create_handover_app(kube=wire_client)
+    with TestClient(app) as client:
+        assert client.post("/handovers", json=BODY).status_code == 202
+
+    state = get("/_mock/reconcile/state")
+    assert state["registered"] == [PV_NAME]
+    assert state["pending"] == 1
+
+    first = post("/_mock/reconcile")
+    assert first["round"] == state["round"] + 1
+    assert first["registered"] == 1
+    assert first["attempted"] == [PV_NAME]
+    assert first["bound"] == [PV_NAME]
+    assert first["pending"] == 0
+
+    second = post("/_mock/reconcile")
+    assert second["registered"] == 0
+    assert second["attempted"] == []
+    assert second["bound"] == []
+
+
+def test_reconcile_http_waits_for_an_unmet_claim_to_change(wire_client, live_servers):
+    store, base_url = live_servers
+
+    def post(path: str, body: dict | None = None) -> tuple[int, dict]:
+        data = json.dumps(body).encode() if body is not None else b""
+        request = urllib.request.Request(
+            f"{base_url}{path}", data=data, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
+    # Create a handover whose claim does not pre-bind the volume (submit
+    # first while it does, then remove the pre-bind via same-name rebuild).
+    app = create_handover_app(kube=wire_client)
+    with TestClient(app) as client:
+        assert client.post("/handovers", json=BODY).status_code == 202
+
+    store.delete_pvc("monitoring", "prometheus-data-new")
+    store.create_pvc("monitoring", pvc_fixture(volume_name=None))
+
+    _, first = post("/_mock/reconcile")
+    assert first["attempted"] == [PV_NAME]
+    assert first["bound"] == []
+
+    _, quiet = post("/_mock/reconcile")
+    assert quiet["attempted"] == [], "unmet conditions are not retried blindly"
+
+    # The claim changes again (this time correctly pre-bound): the next
+    # round picks the volume up and binds it.
+    store.delete_pvc("monitoring", "prometheus-data-new")
+    store.create_pvc("monitoring", pvc_fixture())
+    _, resumed = post("/_mock/reconcile")
+    assert resumed["attempted"] == [PV_NAME]
+    assert resumed["bound"] == [PV_NAME]

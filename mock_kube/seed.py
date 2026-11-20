@@ -36,6 +36,44 @@ NEW_CLAIM = "prometheus-data-rebuilt"
 RIVAL_CLAIM = "prometheus-data-rival"
 WRONG_MODE_CLAIM = "prometheus-data-block"
 
+# Extra pre-reserved volumes for demonstrating an incremental reconcile round
+# (and the "change a few volumes, then look at the next round" flow). Both PVs
+# already carry a claimRef to their replacement claim, but the claims are not
+# pre-bound yet (no ``spec.volumeName``), so the first round attempts them and
+# leaves them unbound until the claims themselves change.
+EXTRA_PVS = (
+    "pvc-batch-aaaa-0000-0000-000000000001",
+    "pvc-batch-bbbb-0000-0000-000000000002",
+)
+EXTRA_OLD_UIDS = (
+    "b1a1c0de-0001-4a01-8a01-000000000001",
+    "b1a1c0de-0002-4a02-8a02-000000000002",
+)
+EXTRA_NEW_UIDS = (
+    "b1a1c0de-0001-4a01-8a01-000000000011",
+    "b1a1c0de-0002-4a02-8a02-000000000012",
+)
+EXTRA_CLAIMS = ("grafana-data-rebuilt", "alertmanager-data-rebuilt")
+
+
+def _extra_pvs() -> list[dict[str, Any]]:
+    """Volumes already reserved for their rebuilt claim (claimRef = new UID)."""
+    return [
+        _pv(name, claim_name=claim, claim_uid=new_uid)
+        for name, new_uid, claim in zip(EXTRA_PVS, EXTRA_NEW_UIDS, EXTRA_CLAIMS)
+    ]
+
+
+def _extra_pvcs() -> list[tuple[str, dict[str, Any]]]:
+    """Replacement claims, created but not yet pre-bound (no volumeName)."""
+    return [
+        (
+            NAMESPACE,
+            _pvc(claim, new_uid, volume_name=None, capacity="50Gi"),
+        )
+        for name, new_uid, claim in zip(EXTRA_PVS, EXTRA_NEW_UIDS, EXTRA_CLAIMS)
+    ]
+
 
 def _pv(
     name: str,
@@ -117,6 +155,16 @@ DEMO_BODIES = {
         "old_pvc_uid": WRONG_MODE_OLD_UID,
         "new_pvc": {"namespace": NAMESPACE, "name": WRONG_MODE_CLAIM, "uid": RIVAL_UID},
     },
+    "extra_handovers": [
+        {
+            "pv_name": name,
+            "old_pvc_uid": old_uid,
+            "new_pvc": {"namespace": NAMESPACE, "name": claim, "uid": new_uid},
+        }
+        for name, old_uid, new_uid, claim in zip(
+            EXTRA_PVS, EXTRA_OLD_UIDS, EXTRA_NEW_UIDS, EXTRA_CLAIMS
+        )
+    ],
 }
 
 
@@ -159,3 +207,10 @@ def seed(store: InMemoryKube) -> None:
             volume_mode="Filesystem",
         ),
     )
+
+    # Two extra volumes already reserved for their rebuilt claims, so a
+    # reconcile round has more than one volume to work through.
+    for pv in _extra_pvs():
+        store.create_pv(pv)
+    for namespace, pvc in _extra_pvcs():
+        store.create_pvc(namespace, pvc)
